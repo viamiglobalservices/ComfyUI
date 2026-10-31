@@ -542,21 +542,37 @@ async def cloud_auth(request):
     A plain Vast API key can read the marketplace but is refused by every
     endpoint that changes something -- creating an instance or a volume,
     deleting one, even reading the balance -- unless the account has been
-    logged into with 2FA. This reports that state so the admin knows
-    whether the cloud tier can actually run.
+    logged into with 2FA.
+
+    The session key is checked by listing our instances, which is a read
+    that still requires the session. A key file that has expired therefore
+    shows up here as "expired" rather than pretending to be fine.
     """
     from cloud import registry
-    result = {}
+    result = {"session_key": False, "working": False}
     try:
         provider = registry.build_provider("vast")
         result["session_key"] = provider.has_session_key()
-        status = provider.tfa_status()
-        result["tfa"] = {
-            "enabled": bool(status.get("tfa_enabled")),
-            "methods": [m.get("method") for m in (status.get("methods") or [])],
-            "backup_codes_remaining": status.get("backup_codes_remaining"),
-        }
-        result["error"] = status.get("error")
+
+        if result["session_key"]:
+            try:
+                instances = provider.list_instances()
+                result["working"] = True
+                result["instances"] = len(instances)
+            except Exception as exc:
+                result["error"] = str(exc)
+                result["expired"] = True
+        else:
+            # Without a session we cannot even ask about 2FA, so report the
+            # reason Vast gives for every account action.
+            status = provider.tfa_status()
+            result["tfa"] = {
+                "enabled": bool(status.get("tfa_enabled")),
+                "methods": [m.get("method") for m in (status.get("methods") or [])],
+                "backup_codes_remaining": status.get("backup_codes_remaining"),
+            }
+            result["error"] = status.get("error")
+            result["expired"] = False
     except Exception as exc:
         result["error"] = str(exc)
     return web.json_response(result)
@@ -597,8 +613,18 @@ async def cloud_auth_login(request):
             backup_code=str((payload or {}).get("backup_code") or ""))
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=400)
+
+    # Confirm the new key really works, so the UI can say so rather than
+    # hope. Listing our instances is a read that still needs the session.
+    working = False
+    try:
+        provider.list_instances()
+        working = True
+    except Exception as exc:
+        data["warning"] = str(exc)
     return web.json_response({
         "session_key": bool(data.get("session_key")),
+        "working": working,
         "backup_codes_remaining": data.get("backup_codes_remaining"),
         "msg": data.get("msg") or "2FA login successful",
     })
