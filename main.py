@@ -298,6 +298,11 @@ if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supporte
             # comfy-aimdo 0.4.9 protocol.
             aimdo_initialized = comfy_aimdo.control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices())
 
+        # vidAI local patch: skip DynamicVRAM on ROCm iGPUs (gfx1035) where the
+        # VBAR virtual-address reservation fails with MemoryError.
+        if os.environ.get("VIDAI_DISABLE_AIMDO", "").lower() in ("1", "true", "yes"):
+            aimdo_initialized = False
+
         if aimdo_initialized:
             if console_log_level == 'DEBUG':
                 comfy_aimdo.control.set_log_debug()
