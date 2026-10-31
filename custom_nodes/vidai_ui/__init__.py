@@ -307,15 +307,37 @@ async def cloud_draft(request):
     if not user_request:
         return web.json_response({"error": "expected {\"request\": \"...\"}"}, status=400)
     try:
-        params = drafter.draft_workflow(
+        # Route first (which checkpoint fits this request), then draft.
+        params = drafter.route_and_draft(
             user_request,
-            model=(payload or {}).get("model"),
-            candidates=(payload or {}).get("candidates"),
+            installed=(payload or {}).get("installed"),
+            preferred=(payload or {}).get("model"),
             llm_model=(payload or {}).get("llm_model"),
         )
+    except LookupError as exc:
+        return web.json_response({"error": str(exc)}, status=409)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=502)
     return web.json_response(params)
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/models")
+async def cloud_models(request):
+    """The model catalogue and the routing decision for a sample request."""
+    from cloud import models as model_registry
+    sample = request.query.get("q") or ""
+    catalogue = [m.to_dict() for m in model_registry.all_models()]
+    answer = None
+    if sample:
+        try:
+            answer = model_registry.route(sample).to_dict()
+        except LookupError as exc:
+            answer = {"error": str(exc)}
+    return web.json_response({
+        "catalogue": catalogue,
+        "route": answer,
+        "lora_by_family": model_registry.LORA_BY_FAMILY,
+    })
 
 
 @PromptServer.instance.routes.post("/vidai/cloud/submit")
