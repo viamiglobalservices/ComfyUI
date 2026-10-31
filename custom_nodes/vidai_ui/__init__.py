@@ -364,6 +364,26 @@ async def cloud_costs(request):
     })
 
 
+@PromptServer.instance.routes.get("/vidai/cloud/report")
+async def cloud_report(request):
+    """Every prompt with what it cost and how the image scored."""
+    from cloud import ledger
+    return web.json_response({
+        "report": ledger.prompt_cost_report(
+            limit=int(request.query.get("limit", 100))),
+        "summary": ledger.job_summary(),
+    })
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/sweep")
+async def cloud_sweep(request):
+    """Destroy any rented pod this process has lost track of."""
+    from cloud import sweeper
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, sweeper.get_sweeper().sweep)
+    return web.json_response(result)
+
+
 @PromptServer.instance.routes.post("/vidai/cloud/score")
 async def cloud_score(request):
     from cloud import drafter
@@ -412,11 +432,14 @@ async def cloud_offers(request):
 
 
 def _start_cloud():
-    """Kick off the queue worker and create the cost ledger."""
+    """Kick off the queue worker, the cost ledger and the pod sweeper."""
     try:
-        from cloud import ledger, orchestrator
+        from cloud import ledger, orchestrator, sweeper
         ledger.init_db()
         orchestrator.get_orchestrator().start()
+        # The sweeper destroys pods this process lost track of. Without it a
+        # crash between renting and destroying would leak a billing GPU.
+        sweeper.get_sweeper().start()
     except Exception as exc:      # never block ComfyUI startup
         print(f"[vidai_ui] cloud tier not started: {exc}")
 
