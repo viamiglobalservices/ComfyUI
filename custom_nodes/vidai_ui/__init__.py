@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -27,6 +28,10 @@ WORKFLOW_DIR = Path(os.environ.get("VIDAI_WORKFLOWS", PROJECT_DIR / "workflows")
 COMFY_INPUT = Path(__file__).resolve().parents[2] / "input"
 UI_CONVERTER = PROJECT_DIR / "scripts" / "workflow_to_ui.py"
 HISTORY_LOG = PROJECT_DIR / "prompts" / "history.jsonl"
+
+# The cloud package lives next to this repo, not inside ComfyUI.
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 
 def slugify(text, limit=48):
@@ -217,6 +222,206 @@ async def get_progress(request):
         "nodes": nodes,
         "last_node_id": PromptServer.instance.last_node_id,
     })
+
+
+# ---------------------------------------------------------------------------
+# Cloud execution tier
+#
+#   GET    /vidai/cloud/settings        read the admin settings
+#   POST   /vidai/cloud/settings        update them
+#   GET    /vidai/cloud/providers        which providers are usable right now
+#   POST   /vidai/cloud/draft           draft a workflow with the LLM
+#   POST   /vidai/cloud/submit          queue a job to be rendered on a GPU
+#   GET    /vidai/cloud/queue           queue + rental state
+#   GET    /vidai/cloud/costs           spend summary, jobs and rentals
+#   POST   /vidai/cloud/score           score a rendered image with the LLM
+#   GET    /vidai/cloud/offers          live prices from the providers
+# ---------------------------------------------------------------------------
+
+PROJECT_DIR = Path(__file__).resolve().parents[3]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+
+def _cloud():
+    """Import the cloud package lazily so ComfyUI still starts without it."""
+    from cloud import config as cloud_config
+    return cloud_config
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/settings")
+async def cloud_get_settings(request):
+    from cloud import config as cloud_config
+    from cloud import registry
+    settings = cloud_config.get_config().get()
+    return web.json_response({
+        "settings": settings,
+        "available_providers": registry.available_providers(),
+        "configured": {
+            "vast": bool(cloud_config.provider_key("vast")),
+            "runpod": bool(cloud_config.provider_key("runpod")),
+        },
+    })
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/settings")
+async def cloud_update_settings(request):
+    from cloud import config as cloud_config
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    patch = payload.get("settings") if isinstance(payload, dict) else None
+    if not isinstance(patch, dict):
+        return web.json_response({"error": "expected {\"settings\": {...}}"}, status=400)
+    try:
+        updated = cloud_config.get_config().update(patch)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response({"settings": updated})
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/providers")
+async def cloud_providers(request):
+    from cloud import registry
+    from cloud import config as cloud_config
+    return web.json_response({
+        "available": registry.available_providers(),
+        "configured": {
+            "vast": bool(cloud_config.provider_key("vast")),
+            "runpod": bool(cloud_config.provider_key("runpod")),
+        },
+        "default_provider": cloud_config.get_config().get().get("default_provider"),
+        "routing_mode": cloud_config.get_config().get().get("routing_mode"),
+    })
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/draft")
+async def cloud_draft(request):
+    from cloud import drafter
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    user_request = (payload or {}).get("request") or ""
+    if not user_request:
+        return web.json_response({"error": "expected {\"request\": \"...\"}"}, status=400)
+    try:
+        params = drafter.draft_workflow(
+            user_request,
+            model=(payload or {}).get("model"),
+            candidates=(payload or {}).get("candidates"),
+            llm_model=(payload or {}).get("llm_model"),
+        )
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response(params)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/submit")
+async def cloud_submit(request):
+    from cloud import orchestrator
+    from cloud.base import JobRequest
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    workflow = (payload or {}).get("workflow")
+    if not isinstance(workflow, dict) or not workflow:
+        return web.json_response({"error": "expected {\"workflow\": {...}}"}, status=400)
+    kind = (payload or {}).get("kind") or "image"
+    request_obj = JobRequest(
+        workflow=workflow,
+        kind=kind,
+        timeout_seconds=int((payload or {}).get("timeout_seconds") or 3600),
+        label=(payload or {}).get("label") or "cloud",
+    )
+    job_id = orchestrator.get_orchestrator().submit(
+        request_obj,
+        prompt=(payload or {}).get("prompt") or "",
+        label=request_obj.label,
+    )
+    return web.json_response({"job_id": job_id, "queued": True})
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/queue")
+async def cloud_queue(request):
+    from cloud import orchestrator
+    return web.json_response(orchestrator.get_orchestrator().queue_state())
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/costs")
+async def cloud_costs(request):
+    from cloud import ledger
+    jobs = ledger.list_jobs(limit=int(request.query.get("limit", 50)))
+    for job in jobs:
+        job["amortised_cost_usd"] = round(
+            ledger.amortised_cost(job.get("rental_id")), 8)
+    return web.json_response({
+        "summary": ledger.job_summary(),
+        "jobs": jobs,
+        "rentals": ledger.list_rentals(limit=int(request.query.get("limit", 50))),
+    })
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/score")
+async def cloud_score(request):
+    from cloud import drafter
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    path = (payload or {}).get("path") or ""
+    prompt = (payload or {}).get("prompt") or ""
+    if not path or not Path(path).exists():
+        return web.json_response({"error": "expected {\"path\": \"...\"}"}, status=400)
+    try:
+        result = drafter.score_image(path, prompt,
+                                     llm_model=(payload or {}).get("llm_model"))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response(result)
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/offers")
+async def cloud_offers(request):
+    """Live prices from whichever provider the admin asked for."""
+    from cloud import registry
+    from cloud import config as cloud_config
+    provider = request.query.get("provider") or \
+        cloud_config.get_config().get().get("default_provider") or "vast"
+    if provider == "local":
+        return web.json_response({"provider": provider, "offers": []})
+    try:
+        instance_provider = registry.build_provider(provider)
+        offers = instance_provider.search_offers()
+    except Exception as exc:
+        return web.json_response({"provider": provider, "error": str(exc),
+                                  "offers": []}, status=200)
+    slim = []
+    for offer in offers[:20]:
+        slim.append({
+            "id": offer.get("id"),
+            "gpu": offer.get("gpu_name") or offer.get("gpu_type_id"),
+            "dph": offer.get("dph_total") or offer.get("community_price"),
+            "vram_mb": offer.get("gpu_totalram"),
+            "disk_gb": offer.get("disk_space"),
+            "location": offer.get("geolocation") or offer.get("country_code"),
+        })
+    return web.json_response({"provider": provider, "offers": slim})
+
+
+def _start_cloud():
+    """Kick off the queue worker and create the cost ledger."""
+    try:
+        from cloud import ledger, orchestrator
+        ledger.init_db()
+        orchestrator.get_orchestrator().start()
+    except Exception as exc:      # never block ComfyUI startup
+        print(f"[vidai_ui] cloud tier not started: {exc}")
+
+
+_start_cloud()
 
 
 WEB_DIRECTORY = "./web"
