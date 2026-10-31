@@ -235,6 +235,13 @@ async def get_progress(request):
 #   GET    /vidai/cloud/queue           queue + rental state
 #   GET    /vidai/cloud/costs           spend summary, jobs and rentals
 #   GET    /vidai/cloud/volumes         the persistent volume and its monthly cost
+#   POST   /vidai/cloud/volume/create   create the persistent volume
+#   POST   /vidai/cloud/volume/delete   delete it and stop the storage charge
+#   POST   /vidai/cloud/volume/adopt    use a volume that already exists
+#   GET    /vidai/cloud/volume/offers   volume offers, cheapest storage first
+#   GET    /vidai/cloud/auth             can the provider act on the account?
+#   POST   /vidai/cloud/auth/send-code   send a 2FA code
+#   POST   /vidai/cloud/auth/login       complete 2FA, store the session key
 #   POST   /vidai/cloud/score           score a rendered image with the LLM
 #   GET    /vidai/cloud/offers          live prices from the providers
 #   GET    /vidai/cloud/models          model catalogue and routing decision
@@ -400,22 +407,15 @@ async def cloud_volumes(request):
     quoting for the volume we have configured.
     """
     from cloud import ledger
-    from cloud import config as cloud_config
-    from cloud import registry
+    from cloud.volumes import VolumeManager
 
-    settings = cloud_config.get_config().get()
-    volume_id = int((settings.get("vast") or {}).get("volume_id") or 0)
+    manager = VolumeManager()
+    status = manager.status()
 
-    live = {}
+    volume_id = status.get("configured_volume_id") or 0
+    live = status.get("current") or {}
     if volume_id:
-        try:
-            provider = registry.build_provider("vast")
-            live = provider.volume_info(volume_id)
-        except Exception as exc:
-            live = {"error": str(exc), "volume_id": str(volume_id)}
-
-    # Keep the ledger row in step with the live rate.
-    if live.get("monthly_cost_usd"):
+        # Keep the ledger row in step with the live rate.
         try:
             ledger.record_volume("vast", str(volume_id),
                                  float(live.get("size_gb") or 0),
@@ -425,9 +425,6 @@ async def cloud_volumes(request):
         except Exception:
             pass
 
-    tracked = ledger.volume_monthly_cost(str(volume_id)) if volume_id else {}
-    # Every volume we know about, with the live rate folded in, so the admin
-    # can see what each one costs per month.
     rows = []
     for volume in ledger.list_volumes(limit=20):
         detail = ledger.volume_monthly_cost(
@@ -437,11 +434,173 @@ async def cloud_volumes(request):
             "provider": volume.get("provider"),
         })
         rows.append(detail)
+
+    status["live"] = live
+    status["volumes"] = rows
+    return web.json_response(status)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/volume/create")
+async def cloud_volume_create(request):
+    """Create the persistent volume over the API.
+
+    The size is fixed at creation and cannot be changed, and the volume can
+    only be attached to GPUs on the host it was created on, so the app picks
+    a host that also carries a GPU we can rent.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from cloud.volumes import VolumeManager
+
+    size_gb = float((payload or {}).get("size_gb") or 0)
+    offer_id = int((payload or {}).get("offer_id") or 0)
+    machine_id = int((payload or {}).get("machine_id") or 0)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: VolumeManager().create(
+                size_gb=size_gb, offer_id=offer_id, machine_id=machine_id))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(result)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/volume/delete")
+async def cloud_volume_delete(request):
+    """Delete the volume and stop the storage charge.
+
+    This destroys the models and the cached venv, so it refuses while an
+    instance is still attached to the volume.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from cloud.volumes import VolumeManager
+
+    volume_id = int((payload or {}).get("volume_id") or 0)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: VolumeManager().delete(volume_id=volume_id))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(result)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/volume/adopt")
+async def cloud_volume_adopt(request):
+    """Use a volume that already exists, e.g. one made in the Vast console."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from cloud.volumes import VolumeManager
+
+    volume_id = int((payload or {}).get("volume_id") or 0)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: VolumeManager().adopt_existing(volume_id))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(result)
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/volume/offers")
+async def cloud_volume_offers(request):
+    """Volume offers, cheapest storage first."""
+    from cloud import registry
+    size_gb = float(request.query.get("size_gb") or 0)
+    machine_id = int(request.query.get("machine_id") or 0)
+    try:
+        provider = registry.build_provider("vast")
+        offers = provider.search_volumes(size_gb=size_gb,
+                                          machine_id=machine_id)
+    except Exception as exc:
+        return web.json_response({"error": str(exc), "offers": []}, status=200)
+    slim = []
+    for offer in offers[:25]:
+        rate = float(offer.get("storage_cost") or 0)
+        size = float(offer.get("disk_space") or 0)
+        slim.append({
+            "id": offer.get("id"),
+            "size_gb": size,
+            "cost_per_gb_month": rate,
+            "monthly_cost_usd": round(rate * size, 4),
+            "machine_id": offer.get("machine_id"),
+            "host_id": offer.get("host_id"),
+            "location": offer.get("geolocation"),
+            "reliability": offer.get("reliability"),
+        })
+    return web.json_response({"offers": slim})
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/auth")
+async def cloud_auth(request):
+    """Whether the provider can act on the account.
+
+    A plain Vast API key can read the marketplace but is refused by every
+    endpoint that changes something -- creating an instance or a volume,
+    deleting one, even reading the balance -- unless the account has been
+    logged into with 2FA. This reports that state so the admin knows
+    whether the cloud tier can actually run.
+    """
+    from cloud import registry
+    result = {}
+    try:
+        provider = registry.build_provider("vast")
+        result["session_key"] = provider.has_session_key()
+        status = provider.tfa_status()
+        result["tfa"] = {
+            "enabled": bool(status.get("tfa_enabled")),
+            "methods": [m.get("method") for m in (status.get("methods") or [])],
+            "backup_codes_remaining": status.get("backup_codes_remaining"),
+        }
+        result["error"] = status.get("error")
+    except Exception as exc:
+        result["error"] = str(exc)
+    return web.json_response(result)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/auth/send-code")
+async def cloud_auth_send_code(request):
+    """Send a 2FA code so the admin can establish a session."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from cloud import registry
+    try:
+        provider = registry.build_provider("vast")
+        data = provider.tfa_send_code(
+            method=(payload or {}).get("method") or "email",
+            phone_number=(payload or {}).get("phone_number") or "")
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(data)
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/auth/login")
+async def cloud_auth_login(request):
+    """Complete 2FA and store the session key."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from cloud import registry
+    try:
+        provider = registry.build_provider("vast")
+        data = provider.tfa_login(
+            code=str((payload or {}).get("code") or ""),
+            method=(payload or {}).get("method") or "totp",
+            secret=str((payload or {}).get("secret") or ""),
+            backup_code=str((payload or {}).get("backup_code") or ""))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     return web.json_response({
-        "configured_volume_id": volume_id,
-        "live": live,
-        "tracked": tracked,
-        "volumes": rows,
+        "session_key": bool(data.get("session_key")),
+        "backup_codes_remaining": data.get("backup_codes_remaining"),
+        "msg": data.get("msg") or "2FA login successful",
     })
 
 
