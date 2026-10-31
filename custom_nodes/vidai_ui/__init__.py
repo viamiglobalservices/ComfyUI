@@ -234,8 +234,11 @@ async def get_progress(request):
 #   POST   /vidai/cloud/submit          queue a job to be rendered on a GPU
 #   GET    /vidai/cloud/queue           queue + rental state
 #   GET    /vidai/cloud/costs           spend summary, jobs and rentals
+#   GET    /vidai/cloud/volumes         the persistent volume and its monthly cost
 #   POST   /vidai/cloud/score           score a rendered image with the LLM
 #   GET    /vidai/cloud/offers          live prices from the providers
+#   GET    /vidai/cloud/models          model catalogue and routing decision
+#   POST   /vidai/cloud/sweep           destroy untracked pods
 # ---------------------------------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
@@ -383,6 +386,62 @@ async def cloud_costs(request):
         "summary": ledger.job_summary(),
         "jobs": jobs,
         "rentals": ledger.list_rentals(limit=int(request.query.get("limit", 50))),
+        "volumes": ledger.list_volumes(limit=20),
+    })
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/volumes")
+async def cloud_volumes(request):
+    """The persistent volume and what it costs.
+
+    A volume is charged every second it exists, whether or not a GPU is
+    running, so the admin needs to see the monthly figure to decide whether
+    it is worth keeping. This also reports the live rate the provider is
+    quoting for the volume we have configured.
+    """
+    from cloud import ledger
+    from cloud import config as cloud_config
+    from cloud import registry
+
+    settings = cloud_config.get_config().get()
+    volume_id = int((settings.get("vast") or {}).get("volume_id") or 0)
+
+    live = {}
+    if volume_id:
+        try:
+            provider = registry.build_provider("vast")
+            live = provider.volume_info(volume_id)
+        except Exception as exc:
+            live = {"error": str(exc), "volume_id": str(volume_id)}
+
+    # Keep the ledger row in step with the live rate.
+    if live.get("monthly_cost_usd"):
+        try:
+            ledger.record_volume("vast", str(volume_id),
+                                 float(live.get("size_gb") or 0),
+                                 float(live.get("cost_per_gb_month") or 0),
+                                 {"machine_id": live.get("machine_id"),
+                                  "host_id": live.get("host_id")})
+        except Exception:
+            pass
+
+    tracked = ledger.volume_monthly_cost(str(volume_id)) if volume_id else {}
+    # Every volume we know about, with the live rate folded in, so the admin
+    # can see what each one costs per month.
+    rows = []
+    for volume in ledger.list_volumes(limit=20):
+        detail = ledger.volume_monthly_cost(
+            volume.get("volume_id"), volume.get("provider") or "vast")
+        detail.update({
+            "configured": str(volume.get("volume_id")) == str(volume_id),
+            "provider": volume.get("provider"),
+        })
+        rows.append(detail)
+    return web.json_response({
+        "configured_volume_id": volume_id,
+        "live": live,
+        "tracked": tracked,
+        "volumes": rows,
     })
 
 
@@ -442,12 +501,29 @@ async def cloud_offers(request):
                                   "offers": []}, status=200)
     slim = []
     for offer in offers[:20]:
+        storage_per_gb_month = float(offer.get("storage_cost") or 0)
+        # The effective rate is what we would actually be charged: the GPU
+        # base plus storage for the disk WE would request, not the disk the
+        # host happens to have.
+        try:
+            rate = instance_provider.estimate_hourly_rate(offer)
+        except Exception:
+            rate = {"dph": offer.get("dph_total"), "dph_base": offer.get("dph_base")}
         slim.append({
             "id": offer.get("id"),
             "gpu": offer.get("gpu_name") or offer.get("gpu_type_id"),
-            "dph": offer.get("dph_total") or offer.get("community_price"),
-            "vram_mb": offer.get("gpu_totalram"),
-            "disk_gb": offer.get("disk_space"),
+            "dph": rate.get("dph"),
+            "dph_base": offer.get("dph_base"),
+            "listed_dph_total": offer.get("dph_total"),
+            "vram_mb": offer.get("gpu_totalram") or offer.get("gpu_ram"),
+            "host_disk_gb": offer.get("disk_space"),
+            # Vast publishes storage in $/GB/MONTH.
+            "storage_per_gb_month": storage_per_gb_month,
+            # Our disk, priced at that rate.
+            "our_disk_gb": rate.get("disk_gb"),
+            "our_disk_per_hour": round(
+                float(rate.get("disk_gb") or 0) * storage_per_gb_month / 720.0, 8),
+            "machine_id": offer.get("machine_id"),
             "location": offer.get("geolocation") or offer.get("country_code"),
         })
     return web.json_response({"provider": provider, "offers": slim})
