@@ -39,6 +39,24 @@ def slugify(text, limit=48):
     return slug[:limit].rstrip("-") or "workflow"
 
 
+async def offload(func, *args, **kwargs):
+    """Run blocking work off the event loop.
+
+    The cloud provider talks to Vast over plain HTTP, and those calls take
+    seconds. Called directly from an ``async def`` handler they would
+    freeze the whole server -- the UI would show every request as
+    pending while the browser sat there. So anything that touches the
+    network runs in a thread instead.
+
+    ``asyncio.to_thread`` is used rather than a fresh executor so the
+    work shares the default pool and is cleaned up with it.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, lambda: func(*args, **kwargs))
+
+
 def workflow_files():
     return [p for p in sorted(WORKFLOW_DIR.glob("*.json"))
             if p.name != "index.json" and not p.name.endswith(".ui.json")]
@@ -232,7 +250,9 @@ async def get_progress(request):
 #   GET    /vidai/cloud/providers        which providers are usable right now
 #   POST   /vidai/cloud/draft           draft a workflow with the LLM
 #   POST   /vidai/cloud/submit          queue a job to be rendered on a GPU
-#   GET    /vidai/cloud/queue           queue + rental state
+#   GET    /vidai/cloud/queue           queue + rental state (incl. a kept-warm instance)
+#   POST   /vidai/cloud/instance/terminate  destroy the instance now, parked or busy
+#   GET    /vidai/cloud/events          what happened to the instances and jobs, with times
 #   GET    /vidai/cloud/costs           spend summary, jobs and rentals
 #   GET    /vidai/cloud/volumes         the persistent volume and its monthly cost
 #   POST   /vidai/cloud/volume/create   create the persistent volume
@@ -318,7 +338,9 @@ async def cloud_draft(request):
         return web.json_response({"error": "expected {\"request\": \"...\"}"}, status=400)
     try:
         # Route first (which checkpoint fits this request), then draft.
-        params = drafter.route_and_draft(
+        # The LLM call takes a while, so it runs off the loop.
+        params = await offload(
+            drafter.route_and_draft,
             user_request,
             installed=(payload or {}).get("installed"),
             preferred=(payload or {}).get("model"),
@@ -352,6 +374,12 @@ async def cloud_models(request):
 
 @PromptServer.instance.routes.post("/vidai/cloud/submit")
 async def cloud_submit(request):
+    """Queue a render on a rented GPU.
+
+    The web UI sends the API-format graph it built, plus the parameters
+    that went into it, so the ledger records what was asked for as well
+    as what it cost.
+    """
     from cloud import orchestrator
     from cloud.base import JobRequest
     try:
@@ -368,18 +396,86 @@ async def cloud_submit(request):
         timeout_seconds=int((payload or {}).get("timeout_seconds") or 3600),
         label=(payload or {}).get("label") or "cloud",
     )
-    job_id = orchestrator.get_orchestrator().submit(
+    # The submit writes a ledger row, so it runs off the loop.
+    job_id = await offload(
+        orchestrator.get_orchestrator().submit,
         request_obj,
         prompt=(payload or {}).get("prompt") or "",
         label=request_obj.label,
+        negative=(payload or {}).get("negative") or "",
+        model=(payload or {}).get("model") or "",
+        lora=(payload or {}).get("lora") or "",
+        steps=(payload or {}).get("steps"),
+        cfg=(payload or {}).get("cfg"),
+        width=(payload or {}).get("width"),
+        height=(payload or {}).get("height"),
     )
     return web.json_response({"job_id": job_id, "queued": True})
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/job/{job_id}")
+async def cloud_job(request):
+    """One job's state, so the UI can follow a render to completion.
+
+    The outputs are absolute paths on this box -- the orchestrator pulls
+    the finished files back from the rented instance and writes them here,
+    so the Gallery and the image viewer can serve them the same way they
+    serve a local render.
+    """
+    from cloud import ledger
+    try:
+        job_id = int(request.match_info["job_id"])
+    except (TypeError, ValueError):
+        return web.json_response({"error": "bad job id"}, status=400)
+    job = ledger.get_job(job_id)
+    if not job:
+        return web.json_response({"error": "no such job"}, status=404)
+    outputs = job.get("outputs")
+    if isinstance(outputs, str):
+        try:
+            outputs = json.loads(outputs)
+        except ValueError:
+            outputs = []
+    job["outputs"] = outputs or []
+    job["amortised_cost_usd"] = round(
+        ledger.amortised_cost(job.get("rental_id")), 8)
+    return web.json_response(job)
 
 
 @PromptServer.instance.routes.get("/vidai/cloud/queue")
 async def cloud_queue(request):
     from cloud import orchestrator
     return web.json_response(orchestrator.get_orchestrator().queue_state())
+
+
+@PromptServer.instance.routes.get("/vidai/cloud/events")
+async def cloud_events(request):
+    """The activity log: what happened to instances and jobs, and when.
+
+    `?limit=` caps how many come back (default 150) and `?after=<id>` returns
+    only newer ones. Oldest first.
+    """
+    from cloud import ledger
+    try:
+        limit = max(1, min(int(request.query.get("limit", 150)), 1000))
+        after = int(request.query.get("after", 0))
+    except ValueError:
+        return web.json_response({"error": "limit and after are integers"}, status=400)
+    return web.json_response({"events": ledger.list_events(limit, after)})
+
+
+@PromptServer.instance.routes.post("/vidai/cloud/instance/terminate")
+async def cloud_instance_terminate(request):
+    """Destroy the rented instance now.
+
+    Works whether it is kept warm, still booting, or in the middle of a
+    render; a render in progress is cancelled. This calls the provider's
+    API, so it runs off the event loop.
+    """
+    from cloud import orchestrator
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, orchestrator.get_orchestrator().terminate_instance)
+    return web.json_response(result)
 
 
 @PromptServer.instance.routes.get("/vidai/cloud/costs")
@@ -410,7 +506,8 @@ async def cloud_volumes(request):
     from cloud.volumes import VolumeManager
 
     manager = VolumeManager()
-    status = manager.status()
+    # The manager asks Vast for the live volume, so it runs off the loop.
+    status = await offload(manager.status)
 
     volume_id = status.get("configured_volume_id") or 0
     live = status.get("current") or {}
@@ -514,8 +611,9 @@ async def cloud_volume_offers(request):
     machine_id = int(request.query.get("machine_id") or 0)
     try:
         provider = registry.build_provider("vast")
-        offers = provider.search_volumes(size_gb=size_gb,
-                                          machine_id=machine_id)
+        offers = await offload(
+            provider.search_volumes, size_gb=size_gb,
+            machine_id=machine_id)
     except Exception as exc:
         return web.json_response({"error": str(exc), "offers": []}, status=200)
     slim = []
@@ -556,7 +654,7 @@ async def cloud_auth(request):
 
         if result["session_key"]:
             try:
-                instances = provider.list_instances()
+                instances = await offload(provider.list_instances)
                 result["working"] = True
                 result["instances"] = len(instances)
             except Exception as exc:
@@ -565,7 +663,7 @@ async def cloud_auth(request):
         else:
             # Without a session we cannot even ask about 2FA, so report the
             # reason Vast gives for every account action.
-            status = provider.tfa_status()
+            status = await offload(provider.tfa_status)
             result["tfa"] = {
                 "enabled": bool(status.get("tfa_enabled")),
                 "methods": [m.get("method") for m in (status.get("methods") or [])],
@@ -588,7 +686,8 @@ async def cloud_auth_send_code(request):
     from cloud import registry
     try:
         provider = registry.build_provider("vast")
-        data = provider.tfa_send_code(
+        data = await offload(
+            provider.tfa_send_code,
             method=(payload or {}).get("method") or "email",
             phone_number=(payload or {}).get("phone_number") or "")
     except Exception as exc:
@@ -606,7 +705,8 @@ async def cloud_auth_login(request):
     from cloud import registry
     try:
         provider = registry.build_provider("vast")
-        data = provider.tfa_login(
+        data = await offload(
+            provider.tfa_login,
             code=str((payload or {}).get("code") or ""),
             method=(payload or {}).get("method") or "totp",
             secret=str((payload or {}).get("secret") or ""),
@@ -618,7 +718,7 @@ async def cloud_auth_login(request):
     # hope. Listing our instances is a read that still needs the session.
     working = False
     try:
-        provider.list_instances()
+        await offload(provider.list_instances)
         working = True
     except Exception as exc:
         data["warning"] = str(exc)
@@ -662,8 +762,10 @@ async def cloud_score(request):
     if not path or not Path(path).exists():
         return web.json_response({"error": "expected {\"path\": \"...\"}"}, status=400)
     try:
-        result = drafter.score_image(path, prompt,
-                                     llm_model=(payload or {}).get("llm_model"))
+        # The vision model call takes a while, so it runs off the loop.
+        result = await offload(
+            drafter.score_image, path, prompt,
+            llm_model=(payload or {}).get("llm_model"))
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=502)
     return web.json_response(result)
@@ -680,7 +782,8 @@ async def cloud_offers(request):
         return web.json_response({"provider": provider, "offers": []})
     try:
         instance_provider = registry.build_provider(provider)
-        offers = instance_provider.search_offers()
+        # The marketplace query takes seconds, so it runs off the loop.
+        offers = await offload(instance_provider.search_offers)
     except Exception as exc:
         return web.json_response({"provider": provider, "error": str(exc),
                                   "offers": []}, status=200)
@@ -727,7 +830,40 @@ def _start_cloud():
         print(f"[vidai_ui] cloud tier not started: {exc}")
 
 
+def _install_cloud_routes():
+    """Point ComfyUI's own render routes at the cloud.
+
+    The web UI and the ComfyUI canvas both render by posting a graph to
+    /prompt and polling /history. Wrapping those two handlers means a
+    render happens on a rented GPU while the caller sees the API it
+    already expects.
+
+    ComfyUI registers its routes *after* the custom nodes are loaded --
+    `init_extra_nodes()` runs first, `add_routes()` second -- so the
+    handlers do not exist yet when this module is imported. The
+    installation is therefore hooked onto `add_routes()` itself, which
+    runs once the routes are on the router.
+    """
+    original_add_routes = PromptServer.add_routes
+
+    def add_routes_and_intercept(self, *args, **kwargs):
+        result = original_add_routes(self, *args, **kwargs)
+        try:
+            from cloud import route_intercept
+            if route_intercept.install(self.app):
+                print("[vidai_ui] renders are routed to the cloud")
+            else:
+                print("[vidai_ui] could not route renders to the cloud; "
+                      "they will run locally")
+        except Exception as exc:      # never block ComfyUI startup
+            print(f"[vidai_ui] cloud routing not installed: {exc}")
+        return result
+
+    PromptServer.add_routes = add_routes_and_intercept
+
+
 _start_cloud()
+_install_cloud_routes()
 
 
 WEB_DIRECTORY = "./web"
