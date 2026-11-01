@@ -5,7 +5,14 @@ __pycache__/
 !/input/example.png
 /models/
 /temp/
-/custom_nodes/
+# Upstream ignores custom_nodes/ because they are separate installations.
+# vidAI vendors ComfyUI into its own repository, and the nodes under here
+# -- ours and the third-party ones -- are part of that repository now. So
+# the directory is no longer ignored; only the caches inside it are.
+!custom_nodes/
+!custom_nodes/**
+/custom_nodes/**/__pycache__/
+/custom_nodes/**/.git/
 !custom_nodes/example_node.py.example
 extra_model_paths.yaml
 /.vs
